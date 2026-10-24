@@ -31,6 +31,7 @@ builder.Services
     });
 
 builder.Services.AddSingleton<EkispertClient>();
+builder.Services.AddSingleton<RouteStore>();
 
 builder.Services
     .AddMcpServer()

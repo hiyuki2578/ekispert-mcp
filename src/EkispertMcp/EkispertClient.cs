@@ -35,6 +35,97 @@ public sealed class EkispertClient(IHttpClientFactory httpClientFactory, ILogger
         return GetAsync("station/light", p, ct);
     }
 
+    // ---- 周辺駅・駅の情報 ----
+
+    /// <summary>座標から半径 radius メートル以内の駅を近い順に取得する。座標は世界測地系。</summary>
+    public Task<JsonElement> GeoStationAsync(double latitude, double longitude, int radius, IReadOnlyList<string> types, int count, CancellationToken ct)
+    {
+        var p = new List<(string, string)>
+        {
+            ("geoPoint", string.Create(CultureInfo.InvariantCulture, $"{latitude},{longitude},wgs84,{radius}")),
+            ("stationCount", count.ToString(CultureInfo.InvariantCulture)),
+            ("gcs", "wgs84"),
+        };
+        if (types.Count > 0) p.Add(("type", string.Join(":", types)));
+        return GetAsync("geo/station", p, ct);
+    }
+
+    /// <summary>住所から半径 radius メートル以内の駅を近い順に取得する。住所の後ろに「,半径」を付けると半径指定になる。</summary>
+    public Task<JsonElement> AddressStationAsync(string address, int radius, IReadOnlyList<string> types, int count, CancellationToken ct)
+    {
+        var p = new List<(string, string)>
+        {
+            ("address", string.Create(CultureInfo.InvariantCulture, $"{address},{radius}")),
+            ("stationCount", count.ToString(CultureInfo.InvariantCulture)),
+            ("gcs", "wgs84"),
+        };
+        if (types.Count > 0) p.Add(("type", string.Join(":", types)));
+        return GetAsync("address/station", p, ct);
+    }
+
+    /// <summary>駅付加情報。kinds は operationLine / rail / nearrail / welfare / exit。</summary>
+    public Task<JsonElement> StationInfoAsync(string code, IReadOnlyList<string> kinds, CancellationToken ct) =>
+        GetAsync("station/info", [("code", code), ("type", string.Join(":", kinds))], ct);
+
+    /// <summary>複数の起点駅から、それぞれの上限時間（分）以内に行ける鉄道駅を探す（範囲探索）。</summary>
+    public Task<JsonElement> MultipleRangeAsync(
+        IReadOnlyList<string> bases, int upperMinute, int? upperTransferCount, bool plane, bool shinkansen, bool limitedExpress, int? limit, CancellationToken ct)
+    {
+        // upperMinute などは起点と同じ数だけ並べる必要がある
+        string Repeat(int value) => string.Join(":", Enumerable.Repeat(value.ToString(CultureInfo.InvariantCulture), bases.Count));
+        var p = new List<(string, string)>
+        {
+            ("baseList", string.Join(":", bases)),
+            ("upperMinute", Repeat(upperMinute)),
+            ("plane", plane ? "true" : "false"),
+            ("shinkansen", shinkansen ? "true" : "false"),
+            ("limitedExpress", limitedExpress ? "true" : "false"),
+            ("includeBaseStation", "true"),
+        };
+        if (upperTransferCount is { } transfer) p.Add(("upperTransferCount", Repeat(transfer)));
+        if (limit is { } l) p.Add(("limit", l.ToString(CultureInfo.InvariantCulture)));
+        return GetAsync("search/multipleRange", p, ct);
+    }
+
+    // ---- 時刻表・運行情報 ----
+
+    /// <summary>
+    /// 鉄道駅時刻表。code を省略すると方面別の時刻表の一覧、指定するとその時刻表を返す。
+    /// date と dateGroup（weekday / saturday / holiday）はどちらか一方を渡す。
+    /// </summary>
+    public Task<JsonElement> StationTimetableAsync(string station, string? code, DateOnly? date, string? dateGroup, CancellationToken ct)
+    {
+        var p = new List<(string, string)> { station.All(char.IsAsciiDigit) ? ("stationCode", station) : ("stationName", station) };
+        if (code is not null) p.Add(("code", code));
+        if (date is { } d) p.Add(("date", d.ToString("yyyyMMdd", CultureInfo.InvariantCulture)));
+        if (dateGroup is not null) p.Add(("dateGroup", dateGroup));
+        return GetAsync("operationLine/timetable", p, ct);
+    }
+
+    /// <summary>レスキューナウ提供の鉄道運行情報。都道府県で絞れる。</summary>
+    public Task<JsonElement> RescueNowInformationAsync(IReadOnlyList<int> prefectureCodes, CancellationToken ct)
+    {
+        var p = new List<(string, string)>();
+        if (prefectureCodes.Count > 0) p.Add(("prefectureCode", string.Join(":", prefectureCodes)));
+        return GetAsync("operationLine/service/rescuenow/information", p, ct);
+    }
+
+    // ---- 経路シリアライズデータを使う操作 ----
+
+    /// <summary>経路の sectionIndex（1 始まり）の区間以降について、前後のダイヤの経路を探す。</summary>
+    public Task<JsonElement> SearchCoursePatternAsync(string serializeData, int sectionIndex, int answerCount, int previousCount, CancellationToken ct) =>
+        GetAsync("search/course/pattern",
+        [
+            ("serializeData", serializeData),
+            ("sectionIndex", sectionIndex.ToString(CultureInfo.InvariantCulture)),
+            ("answerCount", answerCount.ToString(CultureInfo.InvariantCulture)),
+            ("previousCount", previousCount.ToString(CultureInfo.InvariantCulture)),
+        ], ct);
+
+    /// <summary>経路の運賃（fare）または定期代（teiki）を、乗車券を分けて買う場合で計算する。</summary>
+    public Task<JsonElement> DividedPriceAsync(string serializeData, bool teiki, CancellationToken ct) =>
+        GetAsync(teiki ? "course/teiki/divided" : "course/fare/divided", [("serializeData", serializeData)], ct);
+
     // ---- 経路探索 ----
 
     public async Task<JsonElement> SearchCourseAsync(RouteQuery query, CancellationToken ct)

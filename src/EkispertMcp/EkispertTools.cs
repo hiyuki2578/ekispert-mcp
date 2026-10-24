@@ -8,7 +8,7 @@ using ModelContextProtocol.Server;
 namespace EkispertMcp;
 
 [McpServerToolType]
-public sealed class EkispertTools(EkispertClient client)
+public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
 {
     [McpServerTool(Name = "search_route", ReadOnly = true, Idempotent = true)]
     [Description("""
@@ -131,9 +131,117 @@ public sealed class EkispertTools(EkispertClient client)
                   + "round_trip は往復の金額（往復割引などを含む）。commuter_pass は定期代（commuter_pass の種類）。"
                   + "fares は区間ごとの内訳で、lines はその金額がかかる区間の路線名。"
                   + "時刻は日本時間。time_type=average の結果には時刻がなく、duration は平均的な所要時間。"
+                  + "route_id は search_route_other_trains（1 本前・後の便）と split_route_fare（分割購入の運賃・定期代）に渡せる。"
                   + (routes.Any(r => r.HasForecast) ? "forecast=true の金額は運賃改定後の見込額で、確定ではない。" : ""),
         };
     }
+
+    [McpServerTool(Name = "search_route_other_trains", ReadOnly = true, Idempotent = true)]
+    [Description("""
+        search_route で見つけた経路について、前後のダイヤ（1 本前・1 本後の電車など）の経路を探す。
+        「もう少し早い電車は？」「1 本遅らせたら何時に着く？」のようなときに使う。
+        route_id は search_route（またはこのツール）の結果の route_id を渡す。time_type=average で探した経路には使えない。
+        結果は search_route と同じ形で、出発時刻の順に並ぶ。
+        """)]
+    public async Task<object> SearchRouteOtherTrains(
+        [Description("search_route の結果の route_id")] string route_id,
+        [Description("どの区間から先の便を変えるか（segments の 1 始まりの番号。徒歩の区間は不可）。省略時は最初に乗る区間")] int? segment = null,
+        [Description("返す経路の数 (1〜20、元の経路を含む)。既定 5")] int count = 5,
+        [Description("そのうち元の経路より前の便の数（0〜count-1）。省略時は前後ほぼ半々")] int? earlier = null,
+        CancellationToken ct = default)
+    {
+        var route = GetStoredRoute(route_id);
+        if (!route.OnTimetable)
+            throw new McpException("この経路は平均待ち時間探索（time_type=average）の結果なので、前後のダイヤを探せません。時刻を指定して search_route で探し直してください。");
+        if (count is < 1 or > 20) throw new McpException("count は 1〜20 で指定してください。");
+        var previous = earlier ?? (count - 1) / 2;
+        if (previous < 0 || previous >= count) throw new McpException("earlier は 0〜count-1 で指定してください。");
+        if (segment is < 1) throw new McpException("segment は 1 以上で指定してください。");
+
+        var result = await client.SearchCoursePatternAsync(route.SerializeData, segment ?? route.FirstRideSection, count, previous, ct);
+        var routes = Json.Items(result, "Course").Select(c => DescribeCourse(c, false)).ToList();
+        return new
+        {
+            routes,
+            note = "金額や項目の意味は search_route と同じ。元の経路も含めて出発時刻の順に並ぶ。route_id はこのツールや split_route_fare にそのまま渡せる。",
+        };
+    }
+
+    [McpServerTool(Name = "split_route_fare", ReadOnly = true, Idempotent = true)]
+    [Description("""
+        search_route で見つけた経路について、乗車券（または定期券）を途中の駅で分けて買うと安くなるかを計算する（分割購入）。
+        分けたときの区間ごとの金額・合計と、通しで買ったときの金額・差額を返す。
+        kind=fare は片道の乗車券、kind=commuter_pass は 1・3・6 か月の定期券。
+        route_id は search_route（または search_route_other_trains）の結果の route_id を渡す。
+        """)]
+    public async Task<object> SplitRouteFare(
+        [Description("search_route の結果の route_id")] string route_id,
+        [Description("fare=乗車券（既定）, commuter_pass=定期券")] string kind = "fare",
+        CancellationToken ct = default)
+    {
+        var route = GetStoredRoute(route_id);
+        var teiki = ParseOption(kind, nameof(kind), new Dictionary<string, bool> { ["fare"] = false, ["commuter_pass"] = true });
+        var result = await client.DividedPriceAsync(route.SerializeData, teiki, ct);
+
+        var tickets = Json.Items(result, "Ticket").Select(ticket =>
+        {
+            var type = Json.Str(ticket, "type");
+            var parts = Json.Items(ticket, "Part").Select(part =>
+            {
+                var points = Json.Items(part, "Point").ToList();
+                return new
+                {
+                    from = StationName(points.FirstOrDefault()),
+                    to = StationName(points.LastOrDefault()),
+                    price = Json.Int(Json.Child(part, "Price"), "Oneway"),
+                };
+            }).ToList();
+            var total = parts.Sum(p => p.price ?? 0);
+            int? whole = type switch
+            {
+                "fare" => route.CashFare,
+                "teiki1" => route.CommuterPass.One,
+                "teiki3" => route.CommuterPass.Three,
+                "teiki6" => route.CommuterPass.Six,
+                _ => null,
+            };
+            return new
+            {
+                ticket = type switch
+                {
+                    "teiki1" => "commuter_pass_1_month",
+                    "teiki3" => "commuter_pass_3_months",
+                    "teiki6" => "commuter_pass_6_months",
+                    _ => type,
+                },
+                parts,
+                split_total = total,
+                whole_route = whole,
+                saving = whole is { } w ? w - total : (int?)null,
+            };
+        }).ToList();
+
+        return new
+        {
+            tickets,
+            note = tickets.Count == 0
+                ? "分けて買っても安くならない（または分けられる区間がない）経路です。通しで買うのがいちばん安い。"
+                : "金額は円。parts は分けて買う区間ごとの金額、split_total はその合計、whole_route は通しで買ったときの金額、"
+                  + "saving は分けて買うと安くなる額（0 以下なら分けても安くならない）。"
+                  + "乗車券はきっぷ（普通乗車券）の運賃で比べる（IC 運賃ではない）。特急券などの料金は含まない。",
+        };
+    }
+
+    /// <summary>きっぷの運賃の合計。IC 運賃で探索しても、選ばれていない普通乗車券（Type=Fare）の行が返る。</summary>
+    private static int? CashFare(List<JsonElement> prices)
+    {
+        var rows = prices.Where(p => Json.Str(p, "kind") == "Fare" && Json.Str(p, "Type") == "Fare").ToList();
+        return rows.Count == 0 ? null : rows.Sum(p => Json.Int(p, "Oneway") ?? 0);
+    }
+
+    private StoredRoute GetStoredRoute(string routeId) =>
+        routeStore.Get(routeId ?? "")
+        ?? throw new McpException($"route_id「{routeId}」の経路が見つかりません。route_id は MCP サーバーが動いている間だけ使えるので、search_route で探し直してください。");
 
     [McpServerTool(Name = "search_stations", ReadOnly = true, Idempotent = true)]
     [Description("""
@@ -170,7 +278,7 @@ public sealed class EkispertTools(EkispertClient client)
 
     // ---- 応答の整形 ----
 
-    private static object DescribeStation(JsonElement point)
+    internal static object DescribeStation(JsonElement point)
     {
         var station = Json.Child(point, "Station");
         return new
@@ -185,6 +293,7 @@ public sealed class EkispertTools(EkispertClient client)
     }
 
     private sealed record RouteSummary(
+        string? RouteId,
         string? Departure,
         string? Arrival,
         int? Duration,
@@ -202,7 +311,7 @@ public sealed class EkispertTools(EkispertClient client)
         string? CommuterPassRoute,
         [property: System.Text.Json.Serialization.JsonIgnore] bool HasForecast);
 
-    private static RouteSummary DescribeCourse(JsonElement course, bool includeStops)
+    private RouteSummary DescribeCourse(JsonElement course, bool includeStops)
     {
         var route = Json.Child(course, "Route") ?? default;
         var points = Json.Items(route, "Point").ToList();
@@ -279,7 +388,18 @@ public sealed class EkispertTools(EkispertClient client)
         var walk = Json.Int(route, "timeWalk");
         var teiki = Json.Child(course, "Teiki");
 
+        // 前後のダイヤ探索や分割計算に使えるよう、シリアライズデータを覚えて route_id を振る
+        var routeId = Json.Str(course, "SerializeData") is { Length: > 0 } serialized
+            ? routeStore.Add(new StoredRoute(
+                serialized,
+                Json.Str(course, "dataType") == "onTimetable",
+                CashFare(prices) ?? fare,
+                (Summary("Teiki1Summary"), Summary("Teiki3Summary"), Summary("Teiki6Summary")),
+                Math.Max(1, lines.FindIndex(l => Json.Str(l, "Type") != "walk") + 1)))
+            : null;
+
         return new RouteSummary(
+            RouteId: routeId,
             Departure: FormatDateTime(lines.Select(l => Json.Str(Json.Child(l, "DepartureState"), "Datetime")).FirstOrDefault(d => d is not null)),
             Arrival: FormatDateTime(lines.Select(l => Json.Str(Json.Child(l, "ArrivalState"), "Datetime")).LastOrDefault(d => d is not null)),
             Duration: (onBoard ?? 0) + (other ?? 0) + (walk ?? 0),
@@ -304,12 +424,12 @@ public sealed class EkispertTools(EkispertClient client)
             HasForecast: prices.Any(p => Json.Str(p, "RevisionStatus") == "forecast"));
     }
 
-    private static string? StationName(JsonElement? point) =>
+    internal static string? StationName(JsonElement? point) =>
         point is { } p ? Json.Str(Json.Child(p, "Station"), "Name") ?? Json.Str(p, "Name") : null;
 
     /// <summary>2020-08-13T18:41:00+09:00 や 18:41:00+09:00 を 18:41 にする。</summary>
     /// <remarks>平均待ち時間探索では Datetime が日付だけ（2026-10-23）になるので、時刻がなければ null を返す。</remarks>
-    private static string? FormatTime(string? value)
+    internal static string? FormatTime(string? value)
     {
         if (string.IsNullOrEmpty(value)) return null;
         var t = value.Contains('T') ? value[(value.IndexOf('T') + 1)..] : value;
@@ -317,7 +437,7 @@ public sealed class EkispertTools(EkispertClient client)
     }
 
     /// <summary>2020-08-13T18:41:00+09:00 を 2020-08-13 18:41 にする。時刻がなければ null。</summary>
-    private static string? FormatDateTime(string? value) =>
+    internal static string? FormatDateTime(string? value) =>
         value is not null && value.Contains('T') &&
         DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)
             ? dt.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
@@ -346,7 +466,7 @@ public sealed class EkispertTools(EkispertClient client)
         return lines.Count == 0 ? "" : "\n" + string.Join("\n", lines) + "\n候補の名前で探索し直すか、search_stations で調べてください。";
     }
 
-    private static DateTime ParseDateTime(string? date, string? time)
+    internal static DateTime ParseDateTime(string? date, string? time)
     {
         var now = EkispertClient.NowJst();
         var d = DateOnly.FromDateTime(now);
@@ -360,7 +480,7 @@ public sealed class EkispertTools(EkispertClient client)
         return d.ToDateTime(t);
     }
 
-    private static T ParseOption<T>(string value, string name, Dictionary<string, T> options)
+    internal static T ParseOption<T>(string value, string name, Dictionary<string, T> options)
     {
         if (options.TryGetValue(value.Trim().ToLowerInvariant(), out var v)) return v;
         throw new McpException($"{name} は {string.Join(" / ", options.Keys)} のいずれかで指定してください。");
