@@ -8,7 +8,7 @@ using ModelContextProtocol.Server;
 namespace EkispertMcp;
 
 [McpServerToolType]
-public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
+public sealed partial class EkispertTools(EkispertClient client, RouteStore routeStore)
 {
     [McpServerTool(Name = "search_route", ReadOnly = true, Idempotent = true)]
     [Description("""
@@ -45,6 +45,7 @@ public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
         [Description("路線バス・連絡バスを使う")] bool use_local_bus = true,
         [Description("船を使う")] bool use_ferry = true,
         [Description("true なら区間ごとの途中停車駅と時刻も返す（time_type=average では返らない）")] bool include_stops = false,
+        [Description("true なら路線バスだけで探す（時刻表を使わない平均待ち時間の探索。from / to はバス停名か駅名、via・time などは使わない）")] bool bus_only = false,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(from)) throw new McpException("from（出発駅）を指定してください。");
@@ -106,7 +107,9 @@ public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
         JsonElement result;
         try
         {
-            result = await client.SearchCourseAsync(query, ct);
+            result = bus_only
+                ? await client.SearchBusCourseAsync(query.From, query.To, DateOnly.FromDateTime(query.DateTime), ct)
+                : await client.SearchCourseAsync(query, ct);
         }
         catch (EkispertApiException ex) when (ex.Status == HttpStatusCode.BadRequest)
         {
@@ -121,7 +124,9 @@ public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
             from = query.From,
             to = query.To,
             via = viaList.Count > 0 ? viaList : null,
-            search = query.SearchType == "plain"
+            search = bus_only
+                ? $"{query.DateTime:yyyy-MM-dd} バスのみ・平均待ち時間"
+                : query.SearchType == "plain"
                 ? $"{query.DateTime:yyyy-MM-dd} 平均待ち時間"
                 : $"{query.DateTime:yyyy-MM-dd HH:mm} {time_type}",
             routes,
@@ -131,7 +136,9 @@ public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
                   + "round_trip は往復の金額（往復割引などを含む）。commuter_pass は定期代（commuter_pass の種類）。"
                   + "fares は区間ごとの内訳で、lines はその金額がかかる区間の路線名。"
                   + "時刻は日本時間。time_type=average の結果には時刻がなく、duration は平均的な所要時間。"
-                  + "route_id は search_route_other_trains（1 本前・後の便）と split_route_fare（分割購入の運賃・定期代）に渡せる。"
+                  + "route_id は search_route_other_trains（1 本前・後の便）、split_route_fare（分割購入）、apply_commuter_pass（持っている定期券を引く）、"
+                  + "change_route_fare（座席・運賃の切り替え）、get_commuter_pass_refund（定期券の払い戻し）、get_route_stops（停車駅）、"
+                  + "get_route_section_timetable（区間の時刻表）、get_coupons（回数券）に渡せる。"
                   + (routes.Any(r => r.HasForecast) ? "forecast=true の金額は運賃改定後の見込額で、確定ではない。" : ""),
         };
     }
@@ -267,9 +274,24 @@ public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
 
         var result = await client.StationLightAsync(new StationQuery(query.Trim(), partial, typeList, prefList), ct);
         var stations = Json.Items(result, "Point").Select(DescribeStation).ToList();
+        var oldName = false;
+        if (stations.Count == 0)
+        {
+            // 改称した駅は旧駅名でも引ける（例: 旧駅名 → 今の駅名）
+            try
+            {
+                stations = Json.Items(await client.StationAsync(null, query.Trim(), ct), "Point").Select(DescribeStation).ToList();
+                oldName = stations.Count > 0;
+            }
+            catch (EkispertApiException)
+            {
+                // 旧駅名でもなければ、見つからなかったとして返す
+            }
+        }
         return new
         {
             stations,
+            found_by_old_name = oldName ? true : (bool?)null,
             note = stations.Count == 0
                 ? "一致する駅がありません。表記を変えるか partial=true で検索してください。"
                 : "type は train=鉄道, plane=空港, ship=港, bus=バス停（type_detail に local=路線バス, highway=高速バス など）。code は駅コードで、search_route の駅名の代わりにも使える。",
@@ -395,7 +417,9 @@ public sealed class EkispertTools(EkispertClient client, RouteStore routeStore)
                 Json.Str(course, "dataType") == "onTimetable",
                 CashFare(prices) ?? fare,
                 (Summary("Teiki1Summary"), Summary("Teiki3Summary"), Summary("Teiki6Summary")),
-                Math.Max(1, lines.FindIndex(l => Json.Str(l, "Type") != "walk") + 1)))
+                Math.Max(1, lines.FindIndex(l => Json.Str(l, "Type") != "walk") + 1),
+                Json.Str(teiki, "SerializeData"),
+                course.Clone()))
             : null;
 
         return new RouteSummary(

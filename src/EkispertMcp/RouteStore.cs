@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace EkispertMcp;
 
@@ -9,7 +10,16 @@ namespace EkispertMcp;
 /// <param name="CashFare">きっぷ（普通乗車券）の片道運賃の合計。分割計算はきっぷの運賃で行われるので、比べるのに使う</param>
 /// <param name="CommuterPass">1・3・6 か月の定期代</param>
 /// <param name="FirstRideSection">徒歩でない最初の区間のインデックス（1 始まり）</param>
-public sealed record StoredRoute(string SerializeData, bool OnTimetable, int? CashFare, (int? One, int? Three, int? Six) CommuterPass, int FirstRideSection);
+/// <param name="TeikiSerializeData">定期経路シリアライズデータ（定期券として持っている経路を当てはめるときに使う）</param>
+/// <param name="Course">経路探索の Course 要素（運賃・料金の切り替えで Price の index を引くのに使う）</param>
+public sealed record StoredRoute(
+    string SerializeData,
+    bool OnTimetable,
+    int? CashFare,
+    (int? One, int? Three, int? Six) CommuterPass,
+    int FirstRideSection,
+    string? TeikiSerializeData,
+    JsonElement Course);
 
 /// <summary>
 /// 経路シリアライズデータを短い route_id で覚えておく。

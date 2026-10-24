@@ -276,8 +276,7 @@ public sealed class StationTools(EkispertClient client)
             station = stationName,
             date = day?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
             timetables,
-            note = "departures は「時刻 種別 列車名 行き先 番線」。時刻は日本時間で、24 時以降は 24:xx のように表す。"
-                   + "「臨時・運転日注意」の列車は日によって走らないことがある。departures が空なら、その時間帯・曜日区分にこの駅を発車する列車はない。",
+            note = DeparturesNote,
         };
     }
 
@@ -345,7 +344,12 @@ public sealed class StationTools(EkispertClient client)
         }
     }
 
-    private static object DescribeTimetable(JsonElement table, TimeOnly? from, TimeOnly? to)
+    internal const string DeparturesNote =
+        "departures は「時刻 種別 列車名 行き先 番線 #列車コード」。時刻は日本時間で、24 時以降は 24:xx のように表す。"
+        + "#列車コードを get_train_detail に渡すと、その列車の停車駅と時刻が分かる。"
+        + "「臨時・運転日注意」の列車は日によって走らないことがある。departures が空なら、その時間帯にこの駅を発車する列車はない。";
+
+    internal static object DescribeTimetable(JsonElement table, TimeOnly? from, TimeOnly? to)
     {
         // 種別・列車名・行き先はコードで返り、名前は時刻表ごとの一覧から引く
         Dictionary<string, string?> Master(string name) =>
@@ -371,7 +375,9 @@ public sealed class StationTools(EkispertClient client)
                 if (h >= 24 && to is not null) continue;
                 var stop = Json.Child(minute, "Stop") ?? default;
                 // 運転日の違う同じ列車（全席指定の日とそうでない日など）が別々に入るので、時刻と列車番号で 1 本にまとめる
-                if (!seen.Add($"{h}:{m}/{Json.Str(stop, "trainID")}/{Json.Str(stop, "nameCode")}")) continue;
+                // 区間時刻表には列車番号がないので、その場合はまとめない
+                var trainKey = Json.Str(stop, "trainID") is { } trainId ? $"{trainId}/{Json.Str(stop, "nameCode")}" : Json.Str(stop, "lineCode");
+                if (!seen.Add($"{h}:{m}/{trainKey}")) continue;
 
                 var kind = kinds.GetValueOrDefault(Json.Str(stop, "kindCode") ?? "");
                 var name = names.GetValueOrDefault(Json.Str(stop, "nameCode") ?? "");
@@ -387,6 +393,7 @@ public sealed class StationTools(EkispertClient client)
                     Json.Str(stop, "platformNo") is { } no ? no + "番線" : null,
                     Json.Str(stop, "isStarting") == "True" ? "当駅始発" : null,
                     Json.Str(stop, "extra") == "True" ? "臨時・運転日注意" : null,
+                    Json.Str(stop, "lineCode") is { } code ? "#" + code : null,
                 };
                 departures.Add(string.Join(" ", parts.Where(p => !string.IsNullOrEmpty(p))));
             }
@@ -434,7 +441,7 @@ public sealed class StationTools(EkispertClient client)
         }
     }
 
-    private static List<string> ParseTypes(string[]? types)
+    internal static List<string> ParseTypes(string[]? types)
     {
         var typeList = (types ?? []).Select(t => t.Trim().ToLowerInvariant()).Where(t => t.Length > 0).Distinct().ToList();
         var allowed = new[] { "train", "plane", "ship", "bus" };
@@ -443,13 +450,6 @@ public sealed class StationTools(EkispertClient client)
         return typeList;
     }
 
-    private static TimeOnly? ParseTime(string? value, string name)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return null;
-        if (TimeOnly.TryParseExact(value.Trim(), ["H:mm", "HH:mm"], CultureInfo.InvariantCulture, DateTimeStyles.None, out var t)) return t;
-        throw new McpException($"{name} は HH:MM 形式（24 時間制）で指定してください。");
-    }
-
     /// <summary>全角英数字（ＪＲ など）を半角にそろえて比べる。</summary>
-    private static string Normalize(string value) => value.Normalize(System.Text.NormalizationForm.FormKC).ToLowerInvariant();
+    internal static string Normalize(string value) => value.Normalize(System.Text.NormalizationForm.FormKC).ToLowerInvariant();
 }
